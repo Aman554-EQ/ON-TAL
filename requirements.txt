@@ -1,0 +1,12 @@
+# OAT-OSN with Custom Mamba Implementation
+# No external mamba_ssm library needed - built from scratch!
+
+torch>=1.9.0
+torchvision>=0.10.0
+tensorboardX>=2.4
+h5py>=3.1.0
+
+# Optional for development/visualization
+ipdb
+sklearn
+matplotlib
