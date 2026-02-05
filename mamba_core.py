@@ -110,6 +110,57 @@ class SelectiveSSM(nn.Module):
             ys.append(y_i)
             
         return torch.stack(ys, dim=1)
+    
+    def step(self, x, cache):
+        """
+        Single step forward for online inference.
+        x: (B, D) - single frame
+        cache: dict with 'conv_state' and 'ssm_state'
+        Returns: y (B, D), updated cache
+        """
+        conv_state = cache['conv_state']  # (B, d_inner, d_conv)
+        ssm_state = cache['ssm_state']    # (B, d_inner, d_state)
+        
+        # Project input
+        xz = self.in_proj(x)  # (B, d_inner * 2)
+        x_inner, z = xz.chunk(2, dim=-1)  # (B, d_inner)
+        
+        # Update conv state and apply convolution
+        conv_state = torch.roll(conv_state, -1, dims=2)
+        conv_state[:, :, -1] = x_inner
+        x_conv = (conv_state * self.conv1d.weight.squeeze(2)).sum(dim=2) + self.conv1d.bias
+        x_conv = F.silu(x_conv)
+        
+        # Compute SSM parameters
+        x_proj = self.x_proj(x_conv)  # (B, dt_rank + 2*d_state)
+        dt, B_param, C = torch.split(x_proj, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        
+        dt = F.softplus(self.dt_proj(dt))  # (B, d_inner)
+        A = -torch.exp(self.A_log)  # (d_inner, d_state)
+        
+        # SSM step
+        dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0))  # (B, d_inner, d_state)
+        dB = dt.unsqueeze(-1) * B_param.unsqueeze(1)  # (B, d_inner, d_state)
+        
+        ssm_state = dA * ssm_state + dB * x_conv.unsqueeze(-1)
+        y = (ssm_state * C.unsqueeze(1)).sum(dim=-1)  # (B, d_inner)
+        
+        # Output
+        y = y + x_conv * self.D
+        y = y * F.silu(z)
+        y = self.out_proj(y)
+        
+        cache['conv_state'] = conv_state
+        cache['ssm_state'] = ssm_state
+        
+        return y, cache
+    
+    def allocate_inference_cache(self, batch_size, device):
+        """Allocate cache for online inference"""
+        return {
+            'conv_state': torch.zeros(batch_size, self.d_inner, self.d_conv, device=device),
+            'ssm_state': torch.zeros(batch_size, self.d_inner, self.d_state, device=device)
+        }
 
 
 class MambaBlock(nn.Module):
@@ -135,6 +186,22 @@ class MambaBlock(nn.Module):
 
     def forward(self, x):
         return x + self.mamba(self.norm(x))
+    
+    def step(self, x, cache):
+        """Single step for online inference"""
+        y, cache = self.mamba.step(self.norm(x), cache)
+        return x + y, cache
+    
+    def allocate_inference_cache(self, batch_size, device):
+        """Allocate cache for Mamba block"""
+        if USE_OPTIMIZED_MAMBA:
+            # OptimizedMamba has its own cache format
+            return {
+                'conv_state': torch.zeros(batch_size, self.mamba.d_inner, self.mamba.d_conv, device=device),
+                'ssm_state': torch.zeros(batch_size, self.mamba.d_inner, self.mamba.d_state, device=device)
+            }
+        else:
+            return self.mamba.allocate_inference_cache(batch_size, device)
 
 
 class MambaEncoder(nn.Module):
