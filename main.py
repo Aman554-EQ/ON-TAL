@@ -21,7 +21,8 @@ from iou_utils import *
 from eval import evaluation_detection
 from tensorboardX import SummaryWriter
 from dataset import VideoDataSet
-from models import MYNET, SuppressNet
+from mynet_arch import MYNET  # Using fixed architecture with cross-attention
+from models import SuppressNet
 from loss_func import cls_loss_func, regress_loss_func
 
 
@@ -102,6 +103,11 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
 def train(opt):
     writer = SummaryWriter()
     model = MYNET(opt).cuda()
+    
+    # Multi-GPU support - use DataParallel if multiple GPUs available
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel!")
+        model = torch.nn.DataParallel(model)
 
     optimizer = optim.Adam(model.parameters(), lr=opt["lr"], weight_decay=opt["weight_decay"])
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opt["lr_step"])
@@ -110,6 +116,7 @@ def train(opt):
     test_dataset = VideoDataSet(opt, subset=opt['inference_subset'])
 
     warmup = False
+    best_map = 0  # Track best mAP separately for DataParallel compatibility
 
     for n_epoch in range(opt['epoch']):
         if n_epoch >= 1:
@@ -137,16 +144,21 @@ def train(opt):
             n_epoch, tot_loss, cls_loss, reg_loss, IoUmAP_5
         ))
 
-        state = {'epoch': n_epoch + 1, 'state_dict': model.state_dict()}
+        # Save checkpoint - handle DataParallel wrapped model
+        if isinstance(model, torch.nn.DataParallel):
+            state = {'epoch': n_epoch + 1, 'state_dict': model.module.state_dict()}
+        else:
+            state = {'epoch': n_epoch + 1, 'state_dict': model.state_dict()}
+            
         torch.save(state, opt["checkpoint_path"] + "/checkpoint.pth.tar")
-        if IoUmAP_5 > model.best_map:
-            model.best_map = IoUmAP_5
+        if IoUmAP_5 > best_map:
+            best_map = IoUmAP_5
             torch.save(state, opt["checkpoint_path"] + "/ckp_best.pth.tar")
 
         model.train()
 
     writer.close()
-    return model.best_map
+    return best_map
 
 
 def eval_frame(opt, model, dataset):

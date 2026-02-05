@@ -88,26 +88,43 @@ class SelectiveSSM(nn.Module):
         return y
     
     def selective_scan(self, x, dt, A, B, C):
+        """
+        Memory-efficient selective scan using chunked processing.
+        Reduces gradient graph size to avoid OOM.
+        """
         B_batch, L, d_inner = x.shape
         d_state = self.d_state
+        
+        # Chunk size for memory efficiency (smaller = less memory but slower)
+        chunk_size = min(32, L)  # Process 32 timesteps at a time
         
         h = torch.zeros(B_batch, d_inner, d_state, device=x.device, dtype=x.dtype)
         ys = []
         
-        # Vanilla python loop relative scan (slow but correct)
-        # For production/speed, use the fused CUDA kernel via mamba_ssm
-        for i in range(L):
-            dt_i = dt[:, i, :]
-            dA_i = torch.exp(dt_i.unsqueeze(-1) * A.unsqueeze(0)) # (B, d_inner, d_state)
-            B_i = B[:, i, :]
-            dB_i = dt_i.unsqueeze(-1) * B_i.unsqueeze(1) # (B, d_inner, d_state)
-            x_i = x[:, i, :].unsqueeze(-1) # (B, d_inner, 1)
+        for chunk_start in range(0, L, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, L)
+            chunk_ys = []
             
-            h = dA_i * h + dB_i * x_i
+            for i in range(chunk_start, chunk_end):
+                dt_i = dt[:, i, :]
+                dA_i = torch.exp(dt_i.unsqueeze(-1) * A.unsqueeze(0))
+                B_i = B[:, i, :]
+                dB_i = dt_i.unsqueeze(-1) * B_i.unsqueeze(1)
+                x_i = x[:, i, :].unsqueeze(-1)
+                
+                h = dA_i * h + dB_i * x_i
+                
+                C_i = C[:, i, :].unsqueeze(1)
+                y_i = (h * C_i).sum(dim=-1)
+                chunk_ys.append(y_i)
             
-            C_i = C[:, i, :].unsqueeze(1) # (B, 1, d_state)
-            y_i = (h * C_i).sum(dim=-1) # (B, d_inner)
-            ys.append(y_i)
+            # Stack chunk results
+            ys.extend(chunk_ys)
+            
+            # Detach h every chunk to limit gradient graph depth
+            # This trades off exact gradients for memory efficiency
+            if chunk_end < L:
+                h = h.detach()
             
         return torch.stack(ys, dim=1)
     
